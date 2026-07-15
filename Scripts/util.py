@@ -35,6 +35,11 @@ class GenomicDataset(Dataset):
         seq = sample['seq']
         label = sample['label']
         
+        # Enforce max_length truncation to prevent OOM or CNN flat_size crashes
+        # when reading from the raw 100kb FASTA files.
+        if self.max_length and len(seq) > self.max_length:
+            seq = seq[:self.max_length]
+            
         if self.augment and random.random() > 0.5:
             seq = reverse_complement(seq)
             

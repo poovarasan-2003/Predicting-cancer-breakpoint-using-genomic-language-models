@@ -133,12 +133,15 @@ def run_pu_learning(label_key='l99'):
     current_U = initial_unlabeled[:]
     
     model = CaduceusClassifier(model_name).to(device)
-    # Gradient checkpointing is not supported by Caduceus in this version
-    # if hasattr(model.backbone, "gradient_checkpointing_enable"):
-    #     model.backbone.gradient_checkpointing_enable()
+    
+    # CRITICAL: Freeze the 130M parameter backbone to prevent catastrophic forgetting.
+    # We only train the classifier head since the dataset is highly imbalanced and small.
+    for param in model.backbone.parameters():
+        param.requires_grad = False
 
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+    # Increased LR since we are only training the classifier head
+    optimizer = optim.AdamW(model.classifier.parameters(), lr=1e-3)
     # Removed scaler to prevent Mamba deadlock
     
     prev_rn_count = 0
@@ -165,23 +168,24 @@ def run_pu_learning(label_key='l99'):
         
         for s in sampled_U: train_data.append({'seq': s['seq'], 'label': 0})
         
-        # Reduced max_length to 32k to fit in RTX A5000 24GB VRAM
-        SEQ_MAX_LEN = 32768 
+        # Reduced max_length to 1024 to massively improve signal-to-noise ratio
+        # and match the CNN/HyenaDNA implementations.
+        SEQ_MAX_LEN = 1024 
         
         train_ds = GenomicDataset(train_data, tokenizer=tokenizer, max_length=SEQ_MAX_LEN)
-        train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+        # Sequence is 32x shorter, so we can use a larger batch size
+        train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
         
-        # Train for a few epochs per iteration to ensure the model actually learns
-        # the fragile motifs (37 steps per epoch is not enough to converge)
-        torch.cuda.empty_cache() # Clear cache before training
-        for sub_epoch in range(3):
-            print(f"  Training sub-epoch {sub_epoch+1}/3...")
-            train_one_epoch(model, train_loader, optimizer, criterion, device, accumulation_steps=32)
+        # Train for more epochs since training is now very fast and we are only training the head
+        torch.cuda.empty_cache() 
+        for sub_epoch in range(10):
+            print(f"  Training sub-epoch {sub_epoch+1}/10...")
+            train_one_epoch(model, train_loader, optimizer, criterion, device, accumulation_steps=2)
         
         # Get predictions for bounds calculation
         # CRITICAL FIX: Bounds must be calculated based strictly on the POSITIVE set distribution
         p_ds = GenomicDataset(current_P, tokenizer=tokenizer, max_length=SEQ_MAX_LEN)
-        p_loader = DataLoader(p_ds, batch_size=8, shuffle=False)
+        p_loader = DataLoader(p_ds, batch_size=32, shuffle=False)
         p_probs = get_predictions(model, p_loader, device)
         
         q1 = np.percentile(p_probs, 90)
@@ -205,7 +209,7 @@ def run_pu_learning(label_key='l99'):
         # Label RN and RP from Unlabeled set
         unlabeled_ds = GenomicDataset(current_U, tokenizer=tokenizer, max_length=SEQ_MAX_LEN)
         # Speed optimization: Inference doesn't require gradients, so we can use a larger batch size
-        unlabeled_loader = DataLoader(unlabeled_ds, batch_size=8, shuffle=False)
+        unlabeled_loader = DataLoader(unlabeled_ds, batch_size=32, shuffle=False)
         u_probs = get_predictions(model, unlabeled_loader, device)
         
         # CRITICAL SAFEGUARD: Do not label RP if the model is unsure (predicting ~0.5)
@@ -252,7 +256,7 @@ def run_pu_learning(label_key='l99'):
 
     # Final Evaluation on Test Set
     test_ds = GenomicDataset(test_samples, tokenizer=tokenizer, max_length=SEQ_MAX_LEN)
-    test_loader = DataLoader(test_ds, batch_size=8, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=32, shuffle=False)
     test_probs = get_predictions(model, test_loader, device)
     test_labels = np.array([s['label'] for s in test_samples])
     
